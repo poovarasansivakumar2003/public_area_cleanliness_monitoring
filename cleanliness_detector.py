@@ -99,7 +99,57 @@ def flag_abandoned_objects(
     return flagged_ids
 
 
-def detect_spill_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarray] = None, min_area: int = 150) -> Dict:
+def exclude_boxes_from_mask(mask: np.ndarray, boxes: List[Tuple[float, float, float, float]], pad: int = 12) -> np.ndarray:
+    """Zero out (dilated) detection boxes in a mask so the spill/dirt heuristics never analyze
+    a person's clothing, bag texture, etc. as if it were floor. This is the single biggest
+    source of false positives when those heuristics are run on the raw frame."""
+    out = mask.copy()
+    h, w = out.shape[:2]
+    for (x1, y1, x2, y2) in boxes:
+        x1 = max(0, int(x1) - pad)
+        y1 = max(0, int(y1) - pad)
+        x2 = min(w, int(x2) + pad)
+        y2 = min(h, int(y2) + pad)
+        out[y1:y2, x1:x2] = 0
+    return out
+
+
+class BaselineFloorModel:
+    """Optional but recommended: calibrate against a short clip of the EMPTY floor first, then
+    detect spills/dirt as deviations from that specific floor's own baseline brightness/texture
+    instead of fixed absolute thresholds. This removes the vast majority of false positives that
+    come from a patterned or naturally uneven floor (tiles, grout lines, rugs, wood grain), since
+    those patterns are baked into the baseline and no longer read as "anomalies."""
+
+    def __init__(self):
+        self.baseline_v: Optional[np.ndarray] = None   # mean HSV-Value of the empty floor
+        self.baseline_tex: Optional[np.ndarray] = None  # mean local texture (Laplacian) of the empty floor
+
+    def calibrate(self, frames: List[np.ndarray]):
+        vs, texs = [], []
+        for f in frames:
+            hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+            vs.append(cv2.blur(hsv[:, :, 2], (41, 41)).astype(np.float32))
+            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            lap = np.uint8(np.clip(np.abs(cv2.Laplacian(gray, cv2.CV_64F)), 0, 255))
+            texs.append(cv2.blur(lap, (25, 25)).astype(np.float32))
+        self.baseline_v = np.mean(vs, axis=0)
+        self.baseline_tex = np.mean(texs, axis=0)
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self.baseline_v is not None
+
+    def save(self, path: str):
+        np.savez(path, v=self.baseline_v, tex=self.baseline_tex)
+
+    def load(self, path: str):
+        data = np.load(path)
+        self.baseline_v, self.baseline_tex = data["v"], data["tex"]
+
+
+def detect_spill_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarray] = None, min_area: int = 150,
+                            baseline: Optional["BaselineFloorModel"] = None) -> Dict:
     """Detect probable wet spots via specular highlights."""
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     _, s, v = cv2.split(hsv)
@@ -111,10 +161,17 @@ def detect_spill_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarra
     if v_floor.size == 0:
         return {"spill_score": 0.0, "regions": []}
 
-    local_mean = cv2.blur(v, (41, 41))
+    if baseline is not None and baseline.is_calibrated:
+        # Compare against THIS floor's own calibrated baseline brightness instead of a fixed
+        # local-blur estimate — much less sensitive to naturally patterned/uneven floors.
+        local_mean = baseline.baseline_v.astype(np.uint8)
+        threshold = 25  # a calibrated baseline can use a tighter, more confident threshold
+    else:
+        local_mean = cv2.blur(v, (41, 41))
+        threshold = 35
     brightness_delta = cv2.subtract(v, local_mean)
 
-    highlight_mask = ((brightness_delta > 35) & (s < 60)).astype(np.uint8) * 255
+    highlight_mask = ((brightness_delta > threshold) & (s < 60)).astype(np.uint8) * 255
     highlight_mask = cv2.bitwise_and(highlight_mask, highlight_mask, mask=floor_mask)
     highlight_mask = cv2.morphologyEx(highlight_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
@@ -127,7 +184,8 @@ def detect_spill_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarra
     return {"spill_score": spill_score, "regions": regions}
 
 
-def detect_dirt_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarray] = None, min_area: int = 200) -> Dict:
+def detect_dirt_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarray] = None, min_area: int = 200,
+                           baseline: Optional["BaselineFloorModel"] = None) -> Dict:
     """Detect probable dirt/stains via local texture-variance anomalies."""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     if floor_mask is None:
@@ -141,8 +199,14 @@ def detect_dirt_heuristic(frame_bgr: np.ndarray, floor_mask: Optional[np.ndarray
     if floor_texture_vals.size == 0:
         return {"dirt_score": 0.0, "regions": []}
 
-    baseline = np.median(floor_texture_vals)
-    anomaly_mask = ((local_texture.astype(np.int16) - baseline) > 25).astype(np.uint8) * 255
+    if baseline is not None and baseline.is_calibrated:
+        # Per-pixel comparison against this floor's own calibrated texture baseline, rather than
+        # a single global median — a patterned floor's normal texture no longer reads as "dirt."
+        ref_texture = baseline.baseline_tex
+        anomaly_mask = ((local_texture.astype(np.float32) - ref_texture) > 20).astype(np.uint8) * 255
+    else:
+        baseline_val = np.median(floor_texture_vals)
+        anomaly_mask = ((local_texture.astype(np.int16) - baseline_val) > 25).astype(np.uint8) * 255
     anomaly_mask = cv2.bitwise_and(anomaly_mask, anomaly_mask, mask=floor_mask)
     anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
@@ -218,11 +282,15 @@ class CleanlinessMonitor:
         area_type: str = "corridor",
         floor_mask: Optional[np.ndarray] = None,
         conf_thresh: float = 0.35,
+        baseline: Optional["BaselineFloorModel"] = None,
     ):
         self.area_type = area_type
         self.floor_mask = floor_mask
         self.conf_thresh = conf_thresh
         self.tracker = CentroidTracker()
+        # Calibrate this against a clip of the EMPTY floor (see calibrate_baseline_from_video
+        # below) to drastically cut false positives from a patterned/uneven floor surface.
+        self.baseline = baseline
 
         # Load litter model (custom trained) or fallback to stock if custom not yet trained
         if Path(litter_model_path).exists():
@@ -283,8 +351,14 @@ class CleanlinessMonitor:
         tracks = self.tracker.update(litter_dets, ts)
         abandoned_ids = flag_abandoned_objects(tracks, person_dets, ts, stationary_seconds=15.0)
 
-        spill_res = detect_spill_heuristic(frame, self.floor_mask)
-        dirt_res = detect_dirt_heuristic(frame, self.floor_mask)
+        # Critical fix: never let the spill/dirt heuristics analyze pixels that belong to a
+        # detected person or object — clothing texture and bag patterns are not floor dirt.
+        base_mask = self.floor_mask if self.floor_mask is not None else np.ones(frame.shape[:2], dtype=np.uint8) * 255
+        foreground_boxes = [d["box"] for d in litter_dets] + [d["box"] for d in person_dets]
+        effective_mask = exclude_boxes_from_mask(base_mask, foreground_boxes)
+
+        spill_res = detect_spill_heuristic(frame, effective_mask, baseline=self.baseline)
+        dirt_res = detect_dirt_heuristic(frame, effective_mask, baseline=self.baseline)
 
         report = score_cleanliness(
             area_type=self.area_type,
@@ -349,18 +423,48 @@ class CleanlinessMonitor:
         return vis
 
 
+def calibrate_baseline_from_video(source, n_frames: int = 30) -> BaselineFloorModel:
+    """Point this at a short clip (or the first N seconds of a live feed) of the EMPTY floor —
+    no people, no litter, no spills — to build a per-scene baseline. Strongly recommended: this
+    is what lets the heuristics tell 'this floor's normal pattern' apart from 'something changed.'"""
+    cap = cv2.VideoCapture(source)
+    frames = []
+    while len(frames) < n_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"Could not read any frames from '{source}' for baseline calibration.")
+    model = BaselineFloorModel()
+    model.calibrate(frames)
+    print(f"Baseline calibrated from {len(frames)} empty-floor frames.")
+    return model
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cleanliness Monitoring Deployment Pipeline")
     parser.add_argument("--litter-model", default="models/litter_detector_best.pt", help="Path to fine-tuned litter weights")
     parser.add_argument("--person-model", default="yolov8n.pt", help="Path to person detector")
     parser.add_argument("--area", default="corridor", choices=["lobby", "restroom", "corridor", "warehouse"])
     parser.add_argument("--source", default="0", help="Video file or webcam index (0)")
+    parser.add_argument("--conf", type=float, default=0.35, help="Litter detection confidence threshold")
+    parser.add_argument("--calibrate-from", default=None,
+                         help="Path to a short clip/image sequence of the EMPTY floor, used to build a "
+                              "per-scene baseline for the spill/dirt heuristics (strongly recommended)")
     args = parser.parse_args()
+
+    baseline = None
+    if args.calibrate_from:
+        baseline = calibrate_baseline_from_video(args.calibrate_from)
 
     monitor = CleanlinessMonitor(
         litter_model_path=args.litter_model,
         person_model_path=args.person_model,
         area_type=args.area,
+        conf_thresh=args.conf,
+        baseline=baseline,
     )
 
     src = int(args.source) if args.source.isdigit() else args.source
@@ -379,4 +483,3 @@ if __name__ == "__main__":
 
     cap.release()
     cv2.destroyAllWindows()
-

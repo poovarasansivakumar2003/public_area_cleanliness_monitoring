@@ -1,5 +1,7 @@
 TACO/
-yolov8n.pt
+*.pt
+litter_yolo_dataset
+models
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

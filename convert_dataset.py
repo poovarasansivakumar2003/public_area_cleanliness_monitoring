@@ -4,11 +4,12 @@ Convert TACO (or custom COCO-format dataset) to YOLO format for YOLOv8 training.
 
 Fixes:
 1. Filename collision bug across batches (e.g., batch_1/000006.jpg vs batch_2/000006.jpg).
-2. Clamping and validation of bounding box coordinates (prevents corrupted or negative coordinates).
+2. Strict bounding-box validation: drops zero/negative-size boxes and noise-level tiny boxes.
 3. Flexible class mapping:
-   - 'single': All trash items mapped to 1 class 'litter' (Recommended for floor cleanliness monitoring).
-   - 'supercategory': 28 supercategories (e.g. 'Bottle', 'Plastic bag & wrapper', 'Can', 'Cigarette').
+   - 'single': All trash items mapped to 1 class 'litter' (Recommended).
+   - 'supercategory': 28 supercategories (Bottle, Plastic bag, Can, Cigarette...).
    - 'all': Original 60 TACO categories.
+4. data.yaml written with absolute path so training works from any working directory.
 """
 
 import os
@@ -38,13 +39,17 @@ def build_class_mapping(coco: dict, mode: str = "single") -> Tuple[Dict[int, int
         return id_map, class_names
 
     elif mode == "supercategory":
-        supercats = sorted(list(set(c["supercategory"] for c in cats if c.get("supercategory"))))
+        supercats = sorted(list(set(
+            c["supercategory"] for c in cats if c.get("supercategory")
+        )))
         supercat_to_id = {sc: i for i, sc in enumerate(supercats)}
-        id_map = {c["id"]: supercat_to_id[c["supercategory"]] for c in cats if c.get("supercategory") in supercat_to_id}
+        id_map = {
+            c["id"]: supercat_to_id[c["supercategory"]]
+            for c in cats if c.get("supercategory") in supercat_to_id
+        }
         return id_map, supercats
 
     elif mode == "all":
-        # Sort by ID to ensure consistent ordering
         sorted_cats = sorted(cats, key=lambda c: c["id"])
         id_map = {c["id"]: i for i, c in enumerate(sorted_cats)}
         class_names = [c["name"] for c in sorted_cats]
@@ -62,9 +67,18 @@ def convert_coco_to_yolo(
     class_mode: str = "single",
     seed: int = 42,
     copy_files: bool = False,
+    min_box_area: float = 0.0001,   # minimum normalised area (nw*nh); drops noise-level boxes
 ) -> str:
     """
-    Converts COCO dataset to YOLOv8 dataset format.
+    Converts a COCO-format dataset to YOLOv8 dataset layout.
+
+    Improvements over a naive converter
+    ------------------------------------
+    * batch_1/000006.jpg  ->  batch_1_000006.jpg  (zero cross-batch filename collisions)
+    * Degenerate (zero/negative-size) boxes are dropped.
+    * Boxes are clamped to [0,1] in normalised coordinates.
+    * Boxes whose normalised area < min_box_area are dropped (annotation noise).
+    * data.yaml uses the absolute path so training works regardless of cwd.
     """
     coco_path = Path(coco_ann_path)
     if not coco_path.exists():
@@ -74,7 +88,8 @@ def convert_coco_to_yolo(
     coco = load_coco_annotations(str(coco_path))
 
     cat_map, class_names = build_class_mapping(coco, mode=class_mode)
-    print(f"Class mapping mode: '{class_mode}' ({len(class_names)} classes: {class_names[:5]}{'...' if len(class_names)>5 else ''})")
+    preview = class_names[:5]
+    print(f"Class mode: '{class_mode}' -> {len(class_names)} class(es): {preview}{'...' if len(class_names) > 5 else ''}")
 
     img_info = {im["id"]: im for im in coco["images"]}
     anns_by_img: Dict[int, List[dict]] = {}
@@ -95,6 +110,7 @@ def convert_coco_to_yolo(
     processed_count = 0
     skipped_missing = 0
     total_boxes = 0
+    dropped_boxes = 0
 
     for img_id in img_ids:
         info = img_info[img_id]
@@ -120,7 +136,8 @@ def convert_coco_to_yolo(
                 except OSError:
                     shutil.copy2(src_path, dst_img)
 
-        w, h = float(info["width"]), float(info["height"])
+        img_w = float(info["width"])
+        img_h = float(info["height"])
         label_lines = []
 
         for ann in anns_by_img.get(img_id, []):
@@ -129,21 +146,28 @@ def convert_coco_to_yolo(
                 continue
 
             x, y, bw, bh = ann["bbox"]
-            # Validate box dimensions
+
+            # Drop degenerate boxes
             if bw <= 0 or bh <= 0:
+                dropped_boxes += 1
                 continue
 
-            # Convert COCO (top-left x, y, width, height) to YOLO (center_x, center_y, width, height) normalized
-            cx = (x + bw / 2.0) / w
-            cy = (y + bh / 2.0) / h
-            nw = bw / w
-            nh = bh / h
+            # COCO (top-left x,y,w,h) -> YOLO centre-normalised (cx,cy,nw,nh)
+            cx = (x + bw / 2.0) / img_w
+            cy = (y + bh / 2.0) / img_h
+            nw = bw / img_w
+            nh = bh / img_h
 
-            # Clamp coordinates to [0, 1]
+            # Clamp to [0, 1]
             cx = min(max(0.0, cx), 1.0)
             cy = min(max(0.0, cy), 1.0)
-            nw = min(max(0.0001, nw), 1.0)
-            nh = min(max(0.0001, nh), 1.0)
+            nw = min(max(1e-4, nw), 1.0)
+            nh = min(max(1e-4, nh), 1.0)
+
+            # Drop near-invisible boxes (annotation noise)
+            if nw * nh < min_box_area:
+                dropped_boxes += 1
+                continue
 
             cls_id = cat_map[cat_id]
             label_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
@@ -153,37 +177,37 @@ def convert_coco_to_yolo(
         label_path.write_text("\n".join(label_lines), encoding="utf-8")
         processed_count += 1
 
-    # Write data.yaml for YOLOv8
+    # Write data.yaml with absolute path for maximum reproducibility
     yaml_path = out / "data.yaml"
-    clean_names = [name.replace("'", "") for name in class_names]
-    names_str = ", ".join([f"'{name}'" for name in clean_names])
-    yaml_content = f"""# YOLOv8 Dataset Configuration - Public Area Cleanliness Monitoring
-path: {out.resolve()}
-train: images/train
-val: images/val
-nc: {len(class_names)}
-names: [{names_str}]
-"""
+    clean_names = [n.replace("'", "") for n in class_names]
+    names_str = ", ".join([f"'{n}'" for n in clean_names])
+    yaml_content = (
+        f"# YOLOv8 Dataset - Public Area Cleanliness Monitoring\n"
+        f"path: {out.resolve()}\n"
+        f"train: images/train\n"
+        f"val:   images/val\n"
+        f"nc: {len(class_names)}\n"
+        f"names: [{names_str}]\n"
+    )
     yaml_path.write_text(yaml_content, encoding="utf-8")
 
-    print(f"\n--- Dataset Conversion Summary ---")
+    print("\n--- Dataset Conversion Summary ---")
     print(f"Output directory : {out.resolve()}")
-    print(f"Total images     : {processed_count} processed ({skipped_missing} missing)")
-    print(f"Total boxes      : {total_boxes}")
-    print(f"Classes ({len(class_names)}): {class_names}")
-    print(f"Config YAML      : {yaml_path.resolve()}")
+    print(f"Images processed : {processed_count}  (skipped {skipped_missing} missing)")
+    print(f"Boxes written    : {total_boxes}  (dropped {dropped_boxes})")
+    print(f"Classes ({len(class_names)})   : {class_names}")
+    print(f"data.yaml        : {yaml_path.resolve()}")
     return str(yaml_path.resolve())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert TACO COCO dataset to YOLOv8 format.")
-    parser.add_argument("--coco-ann", default="TACO/data/annotations.json", help="Path to annotations.json")
-    parser.add_argument("--images-root", default="TACO/data", help="Root folder containing images")
-    parser.add_argument("--out-dir", default="litter_yolo_dataset", help="Destination YOLO dataset directory")
-    parser.add_argument("--class-mode", choices=["single", "supercategory", "all"], default="single",
-                        help="single: all trash->'litter'; supercategory: 28 superclasses; all: 60 original classes")
-    parser.add_argument("--val-split", type=float, default=0.15, help="Validation fraction (default: 0.15)")
-    parser.add_argument("--copy", action="store_true", help="Copy files instead of hardlinking")
+    parser.add_argument("--coco-ann", default="TACO/data/annotations.json")
+    parser.add_argument("--images-root", default="TACO/data")
+    parser.add_argument("--out-dir", default="litter_yolo_dataset")
+    parser.add_argument("--class-mode", choices=["single", "supercategory", "all"], default="single")
+    parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--copy", action="store_true", help="Copy instead of hardlink")
     args = parser.parse_args()
 
     convert_coco_to_yolo(
@@ -194,4 +218,3 @@ if __name__ == "__main__":
         class_mode=args.class_mode,
         copy_files=args.copy,
     )
-
